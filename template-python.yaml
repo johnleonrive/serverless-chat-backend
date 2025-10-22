@@ -1,0 +1,345 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  serverless-chat-backend
+
+  SAM Template for 1-on-1 chat application with WebSocket API, Lambda functions,
+  DynamoDB tables for connections and messages, and S3 bucket for file uploads.
+
+Parameters:
+  ConnectionsTableName:
+    Type: String
+    Default: "ChatConnections"
+    Description: DynamoDB table for storing WebSocket connection IDs and user mappings
+    MinLength: 3
+    MaxLength: 50
+
+  MessagesTableName:
+    Type: String
+    Default: "ChatMessages"
+    Description: DynamoDB table for storing chat messages
+    MinLength: 3
+    MaxLength: 50
+
+  UploadBucketName:
+    Type: String
+    Default: "chat-file-uploads"
+    Description: S3 bucket for file uploads
+    MinLength: 3
+    MaxLength: 63
+
+Resources:
+  # WebSocket API Gateway
+  ChatWebSocketAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: 1ChatWebSocketAPI
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  # Routes
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ChatWebSocketAPI
+      RouteKey: $connect
+      AuthorizationType: NONE
+      OperationName: ConnectRoute
+      Target: !Join
+        - "/"
+        - - "integrations"
+          - !Ref ConnectInteg
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ChatWebSocketAPI
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      OperationName: DisconnectRoute
+      Target: !Join
+        - "/"
+        - - "integrations"
+          - !Ref DisconnectInteg
+
+  SendMessageRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ChatWebSocketAPI
+      RouteKey: sendmessage
+      AuthorizationType: NONE
+      OperationName: SendMessageRoute
+      Target: !Join
+        - "/"
+        - - "integrations"
+          - !Ref SendMessageInteg
+
+  SendFileRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ChatWebSocketAPI
+      RouteKey: sendfile
+      AuthorizationType: NONE
+      OperationName: SendFileRoute
+      Target: !Join
+        - "/"
+        - - "integrations"
+          - !Ref SendFileInteg
+
+  # Integrations
+  ConnectInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ChatWebSocketAPI
+      Description: Connect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnConnectFunction.Arn}/invocations
+
+  DisconnectInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ChatWebSocketAPI
+      Description: Disconnect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnDisconnectFunction.Arn}/invocations
+
+  SendMessageInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ChatWebSocketAPI
+      Description: Send Message Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendMessageFunction.Arn}/invocations
+
+  SendFileInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ChatWebSocketAPI
+      Description: Send File Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendFileFunction.Arn}/invocations
+
+  # Deployment and Stage
+  Deployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ConnectRoute
+      - DisconnectRoute
+      - SendMessageRoute
+      - SendFileRoute
+    Properties:
+      ApiId: !Ref ChatWebSocketAPI
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: prod
+      Description: Production Stage
+      DeploymentId: !Ref Deployment
+      ApiId: !Ref ChatWebSocketAPI
+
+  # DynamoDB Tables
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref ConnectionsTableName
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  MessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref MessagesTableName
+      AttributeDefinitions:
+        - AttributeName: chatId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: chatId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+
+  # S3 Bucket for file uploads
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref UploadBucketName
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - PUT
+              - POST
+              - GET
+            AllowedOrigins:
+              - "*"
+            MaxAge: 3000
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Lambda Functions
+  OnConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: 1_on_connect
+      CodeUri: on_connect/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.13
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTableName
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionsTableName
+
+  OnDisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: 2-on-disconnect
+      CodeUri: on_disconnect/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.13
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTableName
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionsTableName
+
+  SendMessageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: 3-send-message
+      CodeUri: send_message/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.13
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTableName
+          MESSAGES_TABLE: !Ref MessagesTableName
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionsTableName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MessagesTableName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - "execute-api:ManageConnections"
+              Resource:
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ChatWebSocketAPI}/*"
+
+  SendFileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: 4-send-file
+      CodeUri: send_file/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.13
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          UPLOAD_BUCKET: !Ref UploadBucketName
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref UploadBucketName
+
+  # Lambda Permissions
+  OnConnectPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - ChatWebSocketAPI
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OnConnectFunction
+      Principal: apigateway.amazonaws.com
+
+  OnDisconnectPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - ChatWebSocketAPI
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OnDisconnectFunction
+      Principal: apigateway.amazonaws.com
+
+  SendMessagePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - ChatWebSocketAPI
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SendMessageFunction
+      Principal: apigateway.amazonaws.com
+
+  SendFilePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - ChatWebSocketAPI
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SendFileFunction
+      Principal: apigateway.amazonaws.com
+
+Outputs:
+  WebSocketURI:
+    Description: "WebSocket URI to connect to"
+    Value: !Sub "wss://${ChatWebSocketAPI}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+
+  ConnectionsTableName:
+    Description: "Connections table name"
+    Value: !Ref ConnectionsTableName
+
+  MessagesTableName:
+    Description: "Messages table name"
+    Value: !Ref MessagesTableName
+
+  UploadBucketName:
+    Description: "Upload bucket name"
+    Value: !Ref UploadBucketName
+
+  OnConnectFunctionArn:
+    Description: "OnConnect function ARN"
+    Value: !GetAtt OnConnectFunction.Arn
+
+  OnDisconnectFunctionArn:
+    Description: "OnDisconnect function ARN"
+    Value: !GetAtt OnDisconnectFunction.Arn
+
+  SendMessageFunctionArn:
+    Description: "SendMessage function ARN"
+    Value: !GetAtt SendMessageFunction.Arn
+
+  SendFileFunctionArn:
+    Description: "SendFile function ARN"
+    Value: !GetAtt SendFileFunction.Arn
