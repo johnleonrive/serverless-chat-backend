@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 pylint
+
+      - name: Lint Lambda functions
+        run: |
+          find . -name "lambda_function.py" -type f -exec pylint {} + || true
+
+      - name: Validate SAM template
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: SAM Validate
+        run: sam validate -t template-python.yaml
+
+      - name: SAM Build (verify it builds)
+        run: sam build -t template-python.yaml
