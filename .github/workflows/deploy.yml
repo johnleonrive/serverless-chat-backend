@@ -46,7 +46,7 @@ jobs:
             --parameter-overrides \
               ConnectionsTableName=ChatConnections \
               MessagesTableName=ChatMessages \
-              UploadBucketName=chat-file-uploads-cpsc465
+              UploadBucketName=chat-uploads-jlr-$(date +%s)
 
       - name: Get WebSocket URL
         run: |
