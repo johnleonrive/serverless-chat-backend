@@ -36,7 +36,7 @@ jobs:
           use-installer: true
 
       - name: SAM Validate
-        run: sam validate -t template-python.yaml
+        run: sam validate -t template-python.yaml --region us-east-1
 
       - name: SAM Build (verify it builds)
         run: sam build -t template-python.yaml
