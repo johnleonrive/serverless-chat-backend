@@ -1,186 +1,196 @@
 # Serverless Chat Backend
 
-CPSC 465 Project - Real-time 1-on-1 chat application backend built with AWS Lambda, API Gateway WebSocket, DynamoDB, and S3.
+Real-time serverless chat application backend built with AWS Lambda, API Gateway, DynamoDB, and Cognito for CPSC 465.
 
-## Architecture Overview
+**Team:** Muhammad Shahwar Shamim, Daniel Wright, Ansh Tomar, John-Leon Rivera
 
-This backend implements a serverless 1-on-1 chat system using AWS managed services.
+**Live WebSocket API:** wss://rnf7vtl93i.execute-api.us-east-1.amazonaws.com/prod
+**Live REST API:** https://gbctzghf5d.execute-api.us-east-1.amazonaws.com/prod
+
+## Features
+
+- **WebSocket Messaging** - Real-time bidirectional communication via API Gateway WebSocket
+- **JWT Authentication** - Custom Lambda authorizer validates Cognito tokens
+- **Friend System** - User search, friend requests, accept/reject via REST API
+- **AI Content Moderation** - Hybrid rule-based + Claude API message analysis
+- **Message History** - Persistent storage with retrieval endpoint
+- **Infrastructure as Code** - Entire backend defined in SAM template
+
+## Architecture
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   WebSocket     │     │    REST API     │     │    Cognito      │
+│   API Gateway   │     │   API Gateway   │     │   User Pool     │
+└────────┬────────┘     └────────┬────────┘     └─────────────────┘
+         │                       │
+         ▼                       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      Lambda Functions                            │
+│  ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐       │
+│  │ on_connect│ │send_message│ │get_messages│ │friendships│       │
+│  └───────────┘ └───────────┘ └───────────┘ └───────────┘       │
+│  ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐       │
+│  │disconnect │ │ send_file │ │search_users│ │ moderation│       │
+│  └───────────┘ └───────────┘ └───────────┘ └───────────┘       │
+│  ┌───────────┐                                                  │
+│  │authorizer │                                                  │
+│  └───────────┘                                                  │
+└─────────────────────────────────────────────────────────────────┘
+         │                       │                    │
+         ▼                       ▼                    ▼
+┌─────────────────┐     ┌─────────────────┐  ┌─────────────────┐
+│    DynamoDB     │     │  Claude API     │  │ Secrets Manager │
+│   (4 tables)    │     │  (moderation)   │  │  (API keys)     │
+└─────────────────┘     └─────────────────┘  └─────────────────┘
+```
 
 ## Tech Stack
 
-- **Runtime**: Python 3.13
-- **API**: API Gateway WebSocket
-- **Compute**: AWS Lambda (serverless functions)
-- **Database**: DynamoDB (connections + messages)
-- **Storage**: S3 (file uploads)
-- **IaC**: AWS SAM (Serverless Application Model)
+| Category | Technology |
+|----------|------------|
+| Runtime | Python 3.13 |
+| API | API Gateway (WebSocket + REST) |
+| Compute | AWS Lambda |
+| Database | DynamoDB |
+| Auth | Cognito + Custom Authorizer |
+| AI | Claude 3 Haiku (Anthropic API) |
+| IaC | AWS SAM / CloudFormation |
+| CI/CD | GitHub Actions |
+
+## Lambda Functions
+
+| Function | Trigger | Purpose |
+|----------|---------|---------|
+| 1-on-connect | WebSocket $connect | Store connection, extract user from JWT |
+| 2-on-disconnect | WebSocket $disconnect | Remove connection from database |
+| 3-send-message | WebSocket sendmessage | Process, moderate, store, broadcast messages |
+| 4-send-file | WebSocket sendfile | Generate pre-signed S3 upload URLs |
+| 5-get-messages | REST GET /messages | Fetch message history for a chat |
+| 6-ws-authorizer | WebSocket $connect | Validate Cognito JWT token |
+| 7-friendships | REST /friends/* | Friend CRUD operations |
+| 8-search-users | REST GET /users/search | Search Cognito users by username |
+| 9-moderation | Lambda invoke | AI content moderation (rule-based + Claude) |
+
+## DynamoDB Tables
+
+| Table | Partition Key | Sort Key | Purpose |
+|-------|---------------|----------|---------|
+| ChatConnections | connectionId | - | Active WebSocket connections |
+| ChatMessages | chatId | timestamp | Message storage |
+| ChatFriendships | PK | SK | Friend relationships and requests |
+| ChatModeration | messageId | - | Flagged message records |
 
 ## Project Structure
 
 ```
 serverless-chat-backend/
 ├── on_connect/
-│   ├── lambda_function.py      # Handles WebSocket connections
-│   └── requirements.txt
+│   └── lambda_function.py      # WebSocket connect handler
 ├── on_disconnect/
-│   ├── lambda_function.py      # Handles WebSocket disconnections
-│   └── requirements.txt
+│   └── lambda_function.py      # WebSocket disconnect handler
 ├── send_message/
-│   ├── lambda_function.py      # Sends messages between users
-│   └── requirements.txt
+│   └── lambda_function.py      # Message processing + broadcast
 ├── send_file/
-│   ├── lambda_function.py      # Generates S3 pre-signed URLs for file uploads
-│   └── requirements.txt
-├── template-python.yaml         # SAM template for Python deployment (USE THIS)
-├── template.yaml                # Original Node.js sample (reference only)
-└── README.md                    # This file
+│   └── lambda_function.py      # Pre-signed URL generation
+├── get_messages/
+│   └── lambda_function.py      # Message history retrieval
+├── ws_authorizer/
+│   └── lambda_function.py      # JWT validation
+├── friendships/
+│   └── lambda_function.py      # Friend system CRUD
+├── search_users/
+│   └── lambda_function.py      # Cognito user search
+├── mcp_moderator/
+│   ├── lambda_function.py      # AI moderation Lambda
+│   └── server.py               # MCP server implementation
+├── template-python.yaml        # SAM template
+└── .github/workflows/
+    ├── ci.yml                  # CI: lint, validate
+    └── deploy.yml              # CD: SAM build, deploy
 ```
-
-## Lambda Functions
-
-### 1. on_connect (1_on_connect)
-
-**Trigger**: When a client connects to WebSocket API
-
-**What it does**:
-- Extracts `userId` from query string parameter
-- Stores connection in DynamoDB `ChatConnections` table
-- Sets TTL (24 hours) for automatic cleanup
-
-**Request**: Connect to WebSocket with userId query parameter
-```
-wss://{api-id}.execute-api.us-east-1.amazonaws.com/prod?userId=user123
-```
-
-### 2. on_disconnect (2-on-disconnect)
-
-**Trigger**: When a client disconnects from WebSocket API
-
-**What it does**:
-- Removes connection from DynamoDB `ChatConnections` table
-- Logs disconnection event
-
-### 3. send_message (3-send-message)
-
-**Trigger**: When client sends a message with `action: "sendmessage"`
-
-**What it does**:
-- Validates payload (chatId, text/fileKey)
-- Stores message in DynamoDB `ChatMessages` table
-- Broadcasts message to recipient's active WebSocket connections
-- Handles stale connections (removes if gone)
-
-**Request**:
-```json
-{
-  "action": "sendmessage",
-  "chatId": "user123#user456",
-  "text": "Hello!",
-  "fileKey": "optional-s3-file-key"
-}
-```
-
-### 4. send_file (4-send-file)
-
-**Trigger**: When client requests file upload URL with `action: "sendfile"`
-
-**What it does**:
-- Validates file metadata (chatId, fileName, contentType)
-- Generates S3 pre-signed PUT URL (15 min expiry)
-- Returns URL for client to upload file directly to S3
-
-**Request**:
-```json
-{
-  "action": "sendfile",
-  "chatId": "user123#user456",
-  "fileName": "image.jpg",
-  "contentType": "image/jpeg"
-}
-```
-
-## DynamoDB Tables
-
-### ChatConnections
-
-Maps WebSocket connectionIds to userIds. TTL enabled (24 hours).
-
-### ChatMessages
-
-Stores all 1-on-1 chat messages. Keyed by chatId (format: "user1#user2") and timestamp.
 
 ## Deployment
 
 ### Prerequisites
 
-1. AWS CLI configured with credentials
-2. AWS SAM CLI installed
-3. Python 3.13
+- AWS CLI configured
+- AWS SAM CLI installed
+- Python 3.13
 
-### Deploy to AWS
+### Deploy
 
 ```bash
-# Build the application
+# Build
 sam build -t template-python.yaml
 
-# Deploy (guided first time)
+# Deploy (first time - guided)
 sam deploy --guided --template-file template-python.yaml
 
-# Get WebSocket URL
+# Deploy (subsequent)
+sam deploy --template-file template-python.yaml
+```
+
+### Get API URLs
+
+```bash
 aws cloudformation describe-stacks \
   --stack-name serverless-chat-backend \
-  --query 'Stacks[0].Outputs[?OutputKey==`WebSocketURI`].OutputValue' \
-  --output text
+  --query 'Stacks[0].Outputs' \
+  --output table
 ```
-
-## How Lambda Deployment Works
-
-**Important**: Lambda functions are **code that lives in your repo** but **runs in AWS**.
-
-### Workflow:
-
-```
-1. Edit Lambda code locally (this repo)
-   ↓
-2. Commit to Git (version control)
-   ↓
-3. sam build (packages Python code)
-   ↓
-4. sam deploy (uploads to AWS)
-   ↓
-5. AWS Lambda runs your code when triggered
-```
-
-**Not like a traditional server**:
-- No server running 24/7
-- Functions execute on-demand
-- Auto-scales
-- Pay only when used
 
 ## Testing
+
+### WebSocket Testing with wscat
 
 ```bash
 # Install wscat
 npm install -g wscat
 
-# Connect
-wscat -c "wss://{api-id}.execute-api.us-east-1.amazonaws.com/prod?userId=testuser123"
+# Connect with JWT token
+wscat -c "wss://rnf7vtl93i.execute-api.us-east-1.amazonaws.com/prod?token=YOUR_JWT_TOKEN"
 
 # Send a message
-{"action":"sendmessage","chatId":"testuser123#testuser456","text":"Hello!"}
+{"action":"sendmessage","chatId":"user1#user2","text":"Hello!"}
 ```
 
-## Current Deployment
+### REST API Testing
 
-**AWS Account**: 676206934447 (cpsc465-group)
-**Region**: us-east-1
-**WebSocket URL**: `wss://0o1twopkd9.execute-api.us-east-1.amazonaws.com/prod`
+```bash
+# Get messages
+curl "https://gbctzghf5d.execute-api.us-east-1.amazonaws.com/prod/messages?chatId=user1%23user2"
 
-**Deployed Functions**:
-- 1_on_connect (Python 3.13)
-- 2-on-disconnect (Python 3.13)
-- 3-send-message (Python 3.13)
-- 4-send-file (Python 3.13)
+# Search users
+curl "https://gbctzghf5d.execute-api.us-east-1.amazonaws.com/prod/users/search?q=test&userId=myuser"
+```
+
+## Content Moderation
+
+The moderation system uses a two-layer hybrid approach:
+
+**Layer 1 - Rule-Based (Fast):**
+- Regex patterns for profanity, slurs, threats, spam
+- Instant response, no API call needed
+
+**Layer 2 - AI Analysis (Claude 3 Haiku):**
+- Invoked if rule-based check passes
+- Analyzes context for subtle violations
+- Returns severity: none, low, medium, high
+
+## AWS Resources
+
+| Resource | Value |
+|----------|-------|
+| WebSocket API | rnf7vtl93i |
+| REST API | gbctzghf5d |
+| Region | us-east-1 |
+| Cognito User Pool | us-east-1_OncfX435Y |
+| CloudFormation Stack | serverless-chat-backend |
+
+## Related Repository
+
+- **Frontend:** https://github.com/johnleonrive/serverless-chat-frontend
 
 ## License
 
