@@ -3,7 +3,8 @@ name: Deploy Backend to AWS
 on:
   push:
     branches:
-      - master
+      - main
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -46,7 +47,7 @@ jobs:
             --parameter-overrides \
               ConnectionsTableName=ChatConnections \
               MessagesTableName=ChatMessages \
-              UploadBucketName=chat-uploads-jlr-$(date +%s)
+              UploadBucketName=chat-uploads-jlr-1761161665
 
       - name: Get WebSocket URL
         run: |

@@ -29,6 +29,53 @@ Parameters:
     MaxLength: 63
 
 Resources:
+  # Cognito User Pool for Authentication
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: ChatAppUserPool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: preferred_username
+          Required: false
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: ChatAppClient
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
   # WebSocket API Gateway
   ChatWebSocketAPI:
     Type: AWS::ApiGatewayV2::Api
@@ -37,13 +84,25 @@ Resources:
       ProtocolType: WEBSOCKET
       RouteSelectionExpression: "$request.body.action"
 
+  # WebSocket Authorizer
+  WebSocketAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      Name: CognitoWebSocketAuthorizer
+      ApiId: !Ref ChatWebSocketAPI
+      AuthorizerType: REQUEST
+      AuthorizerUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketAuthorizerFunction.Arn}/invocations
+      IdentitySource:
+        - route.request.querystring.token
+
   # Routes
   ConnectRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:
       ApiId: !Ref ChatWebSocketAPI
       RouteKey: $connect
-      AuthorizationType: NONE
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref WebSocketAuthorizer
       OperationName: ConnectRoute
       Target: !Join
         - "/"
@@ -178,6 +237,56 @@ Resources:
       SSESpecification:
         SSEEnabled: true
 
+  # Moderation Table for flagged messages
+  ModerationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ChatModeration
+      AttributeDefinitions:
+        - AttributeName: messageId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: messageId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Friendships Table for friend requests and relationships
+  FriendshipsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ChatFriendships
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+
   # S3 Bucket for file uploads
   UploadBucket:
     Type: AWS::S3::Bucket
@@ -241,11 +350,12 @@ Resources:
       Handler: lambda_function.lambda_handler
       Runtime: python3.13
       MemorySize: 256
-      Timeout: 10
+      Timeout: 30
       Environment:
         Variables:
           CONNECTIONS_TABLE: !Ref ConnectionsTableName
           MESSAGES_TABLE: !Ref MessagesTableName
+          MODERATION_FUNCTION: !Ref ModerationFunction
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref ConnectionsTableName
@@ -257,6 +367,12 @@ Resources:
                 - "execute-api:ManageConnections"
               Resource:
                 - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ChatWebSocketAPI}/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - "lambda:InvokeFunction"
+              Resource:
+                - !GetAtt ModerationFunction.Arn
 
   SendFileFunction:
     Type: AWS::Serverless::Function
@@ -311,6 +427,200 @@ Resources:
       FunctionName: !Ref SendFileFunction
       Principal: apigateway.amazonaws.com
 
+  # WebSocket Authorizer Function
+  WebSocketAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: 6-ws-authorizer
+      CodeUri: ws_authorizer/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.13
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+          COGNITO_CLIENT_ID: !Ref CognitoUserPoolClient
+          COGNITO_REGION: !Ref AWS::Region
+
+  WebSocketAuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WebSocketAuthorizerFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ChatWebSocketAPI}/authorizers/${WebSocketAuthorizer}
+
+  # REST API for HTTP endpoints (message history, etc.)
+  ChatRestAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: ChatRestAPI
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+
+  # Get Messages Function (REST API)
+  GetMessagesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: 5-get-messages
+      CodeUri: get_messages/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.13
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          MESSAGES_TABLE: !Ref MessagesTableName
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref MessagesTableName
+      Events:
+        GetMessages:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatRestAPI
+            Path: /messages
+            Method: GET
+
+  # Friendships Function (REST API)
+  FriendshipsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: 7-friendships
+      CodeUri: friendships/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.13
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          FRIENDSHIPS_TABLE: ChatFriendships
+          CONNECTIONS_TABLE: !Ref ConnectionsTableName
+          WEBSOCKET_ENDPOINT: !Sub "https://${ChatWebSocketAPI}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: ChatFriendships
+        - DynamoDBReadPolicy:
+            TableName: !Ref ConnectionsTableName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - "execute-api:ManageConnections"
+              Resource:
+                - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ChatWebSocketAPI}/*"
+      Events:
+        ListFriends:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatRestAPI
+            Path: /friends
+            Method: GET
+        SendRequest:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatRestAPI
+            Path: /friends/request
+            Method: POST
+        AcceptRequest:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatRestAPI
+            Path: /friends/accept
+            Method: POST
+        RejectRequest:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatRestAPI
+            Path: /friends/reject
+            Method: POST
+        RemoveFriend:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatRestAPI
+            Path: /friends/remove
+            Method: POST
+        ListRequests:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatRestAPI
+            Path: /friends/requests
+            Method: GET
+
+  # Moderation Function (REST API and direct invocation)
+  ModerationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: 9-moderation
+      CodeUri: mcp_moderator/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.13
+      MemorySize: 512
+      Timeout: 30
+      Environment:
+        Variables:
+          MODERATION_TABLE: ChatModeration
+          MESSAGES_TABLE: !Ref MessagesTableName
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: ChatModeration
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MessagesTableName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:chat-app/claude-api-key-*"
+      Events:
+        AnalyzeMessage:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatRestAPI
+            Path: /moderation/analyze
+            Method: POST
+        GetQueue:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatRestAPI
+            Path: /moderation/queue
+            Method: GET
+        ApplyAction:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatRestAPI
+            Path: /moderation/action
+            Method: POST
+
+  # Search Users Function (REST API)
+  SearchUsersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: 8-search-users
+      CodeUri: search_users/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.13
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:ListUsers
+              Resource: !GetAtt CognitoUserPool.Arn
+      Events:
+        SearchUsers:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatRestAPI
+            Path: /users/search
+            Method: GET
+
 Outputs:
   WebSocketURI:
     Description: "WebSocket URI to connect to"
@@ -343,3 +653,27 @@ Outputs:
   SendFileFunctionArn:
     Description: "SendFile function ARN"
     Value: !GetAtt SendFileFunction.Arn
+
+  GetMessagesFunctionArn:
+    Description: "GetMessages function ARN"
+    Value: !GetAtt GetMessagesFunction.Arn
+
+  RestApiURL:
+    Description: "REST API URL for HTTP endpoints"
+    Value: !Sub "https://${ChatRestAPI}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  CognitoUserPoolId:
+    Description: "Cognito User Pool ID"
+    Value: !Ref CognitoUserPool
+
+  CognitoUserPoolClientId:
+    Description: "Cognito User Pool Client ID"
+    Value: !Ref CognitoUserPoolClient
+
+  CognitoUserPoolArn:
+    Description: "Cognito User Pool ARN"
+    Value: !GetAtt CognitoUserPool.Arn
+
+  WebSocketAuthorizerFunctionArn:
+    Description: "WebSocket Authorizer function ARN"
+    Value: !GetAtt WebSocketAuthorizerFunction.Arn

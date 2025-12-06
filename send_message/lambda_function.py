@@ -10,8 +10,51 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 dynamodb = boto3.resource('dynamodb')
+lambda_client = boto3.client('lambda')
+
 connections_table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
 messages_table = dynamodb.Table(os.environ['MESSAGES_TABLE'])
+
+# Moderation function name (set via environment variable)
+MODERATION_FUNCTION = os.environ.get('MODERATION_FUNCTION', '9-moderation')
+
+
+def moderate_message(text: str, message_id: str, sender_id: str, chat_id: str, timestamp: float) -> dict:
+    """
+    Invoke the moderation Lambda to analyze the message.
+    Returns moderation result with flagged status and severity.
+    """
+    try:
+        response = lambda_client.invoke(
+            FunctionName=MODERATION_FUNCTION,
+            InvocationType='RequestResponse',
+            Payload=json.dumps({
+                'text': text,
+                'messageId': message_id,
+                'senderId': sender_id,
+                'chatId': chat_id,
+                'timestamp': timestamp
+            })
+        )
+
+        result = json.loads(response['Payload'].read())
+        logger.info(f"Raw moderation response: {json.dumps(result)}")
+
+        # Handle Lambda response format
+        if 'body' in result:
+            parsed = json.loads(result['body'])
+            logger.info(f"Parsed moderation result: {json.dumps(parsed)}")
+            return parsed
+        return result
+
+    except Exception as e:
+        logger.error(f"Moderation failed: {e}")
+        # On failure, allow the message through but log the error
+        return {
+            'flagged': False,
+            'severity': 'none',
+            'error': str(e)
+        }
 
 # API Gateway Management API client (created per request)
 def get_apigw_client(endpoint):
@@ -52,13 +95,27 @@ def lambda_handler(event, context):
         timestamp = Decimal(str(time.time()))
         message_id = str(uuid.uuid4())
 
+        # Moderate the message before storing/broadcasting
+        moderation_result = {'flagged': False, 'severity': 'none'}
+        if text:
+            moderation_result = moderate_message(
+                text=text,
+                message_id=message_id,
+                sender_id=sender_id,
+                chat_id=chat_id,
+                timestamp=float(timestamp)
+            )
+            logger.info(f"Moderation result: {json.dumps(moderation_result)}")
+
         message_item = {
             'chatId': chat_id,
             'timestamp': timestamp,
             'messageId': message_id,
             'senderId': sender_id,
             'recipientId': recipient_id,
-            'status': 'sent'
+            'status': 'sent',
+            'flagged': moderation_result.get('flagged', False),
+            'flagSeverity': moderation_result.get('severity', 'none')
         }
 
         if text:
@@ -75,10 +132,15 @@ def lambda_handler(event, context):
             ExpressionAttributeValues={':uid': recipient_id}
         ) if False else {'Items': []}  # Simplified: query all connections
 
-        # Alternative: Scan for recipient connections (less efficient)
-        all_connections = connections_table.scan(
+        # Get all connections for both recipient AND sender (for multi-tab sync)
+        recipient_connections = connections_table.scan(
             FilterExpression='userId = :uid',
             ExpressionAttributeValues={':uid': recipient_id}
+        )
+
+        sender_connections = connections_table.scan(
+            FilterExpression='userId = :uid',
+            ExpressionAttributeValues={':uid': sender_id}
         )
 
         apigw_client = get_apigw_client(endpoint_url)
@@ -90,10 +152,15 @@ def lambda_handler(event, context):
             'senderId': sender_id,
             'text': text,
             'fileKey': file_key,
-            'timestamp': float(timestamp)
+            'timestamp': float(timestamp),
+            'flagged': moderation_result.get('flagged', False),
+            'flagSeverity': moderation_result.get('severity', 'none')
         })
 
-        for conn in all_connections.get('Items', []):
+        # Combine recipient and sender connections (include sender to update flagged status)
+        all_connections = recipient_connections.get('Items', []) + sender_connections.get('Items', [])
+
+        for conn in all_connections:
             try:
                 apigw_client.post_to_connection(
                     ConnectionId=conn['connectionId'],
